@@ -4,19 +4,17 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"go.mongodb.org/mongo-driver/bson"
 	"log"
 	"os"
-	"strconv"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type Record struct {
-	ID              int       `bson:"id"`
-	UserID          int       `bson:"user_id"`
+	UserID          string    `bson:"user_id"`
 	DialogDisplayed string    `bson:"dialog_displayed"`
 	CreatedOn       time.Time `bson:"created_on"`
 	UpdatedOn       time.Time `bson:"updated_on"`
@@ -25,114 +23,133 @@ type Record struct {
 const BatchSize = 100
 
 func main() {
-	// Create or open a log file
-	logFile, err := os.OpenFile("errors.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	errLogFile, err := os.OpenFile("errors.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	successLogFile, err := os.OpenFile("success.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Printf("Failed to open log file: %v\n", err)
 		return
 	}
-	defer logFile.Close()
+	defer errLogFile.Close()
+	defer successLogFile.Close()
 
-	// Set the logger to write to the file
-	logger := log.New(logFile, "", log.LstdFlags)
+	errLogger := log.New(errLogFile, "", log.LstdFlags)
+	successLogger := log.New(successLogFile, "", log.LstdFlags)
 
-	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:27017") //TODO change the URI
 	records := []interface{}{}
 	client, err := mongo.Connect(context.TODO(), clientOptions)
 	if err != nil {
-		logger.Printf("Failed to connect to MongoDB: %v", err)
+		errLogger.Printf("[ERROR] - Failed to connect to MongoDB: %v", err)
 		return
 	}
 	defer client.Disconnect(context.TODO())
 
 	collection := client.Database("your_database_name").Collection("your_collection_name")
 
-	// Open CSV file
 	file, err := os.Open("data.csv")
 	if err != nil {
-		logger.Printf("Failed to open CSV file: %v", err)
+		errLogger.Printf("[ERROR] - Failed to open CSV file: %v", err)
 		return
 	}
 	defer file.Close()
 
 	reader := csv.NewReader(file)
-	// Skip the header line
 	if _, err := reader.Read(); err != nil {
-		logger.Printf("Failed to read CSV header: %v", err)
+		errLogger.Printf("[ERROR] - Failed to read CSV header: %v", err)
 		return
 	}
 
-	// Read and process each line in the CSV
 	for {
 		line, err := reader.Read()
 		if err != nil {
 			if err.Error() == "EOF" {
 				break
 			}
-			logger.Printf("Failed to read CSV line: %v", err)
+			errLogger.Printf("[ERROR] - Failed to read CSV line: %v", err)
 			continue
 		}
 
-		// Parse CSV values
-		userID, err := strconv.Atoi(line[1])
-		if err != nil {
-			logger.Printf("Invalid user_id: %v", err)
-			continue
-		}
 		createdOn, err := time.Parse("2006-01-02T15:04:05Z", line[3])
 		if err != nil {
-			logger.Printf("Invalid created_on date: %v", err)
+			errLogger.Printf("[ERROR] - Invalid created_on date for userID : %s and id : %s ,err: %v", line[1], line[0], err)
 			continue
 		}
 		updatedOn, err := time.Parse("2006-01-02T15:04:05Z", line[4])
 		if err != nil {
-			logger.Printf("Invalid updated_on date: %v", err)
+			errLogger.Printf("[ERROR] - Invalid updated_on date for userID : %s and id : %s ,err: %v", line[1], line[0], err)
 			continue
 		}
 
 		record := Record{
-			UserID:          userID,
+			UserID:          line[1],
 			DialogDisplayed: line[2],
 			CreatedOn:       createdOn,
 			UpdatedOn:       updatedOn,
 		}
 
-		err = findAndInsert(context.Background(), record, collection, &records, logger)
+		err = findAndInsert(context.Background(), record, collection, &records, errLogger, successLogger)
 		if err != nil {
-			logger.Printf("Failed to find and insert record: %v", err)
+			for _, r := range records {
+				if record, ok := r.(Record); ok {
+					successLogger.Printf("[SUCCESS] - Inserted record with UserID: %s\n", record.UserID)
+				} else {
+					errLogger.Printf("[ERROR] - Failed to assert type for record: %v\n", r)
+				}
+			}
 		}
 	}
 
-	// Insert any remaining records
 	if len(records) > 0 {
 		_, err := collection.InsertMany(context.Background(), records)
 		if err != nil {
-			logger.Printf("Failed to insert remaining records: %v", err)
+			errLogger.Printf("[ERROR] - Failed to insert remaining records: %v", err)
+		}
+		for _, r := range records {
+			if record, ok := r.(Record); ok {
+				successLogger.Printf("[SUCCESS] - Inserted record with UserID: %s\n", record.UserID)
+			} else {
+				errLogger.Printf("[ERROR] - Failed to assert type for record: %v\n", r)
+			}
 		}
 	}
 }
 
-func findAndInsert(ctx context.Context, record Record, collection *mongo.Collection, records *[]interface{}, logger *log.Logger) error {
-	var existingRecord Record
-	err := collection.FindOne(ctx, bson.M{"user_id": record.UserID}).Decode(&existingRecord)
+func findAndInsert(ctx context.Context, record Record, collection *mongo.Collection, records *[]interface{}, logger *log.Logger, successLogger *log.Logger) error {
+	filter := bson.M{"user_id": record.UserID}
+	update := bson.M{
+		"$set": bson.M{
+			"dialog_displayed": record.DialogDisplayed,
+			"created_on":       record.CreatedOn,
+			"updated_on":       record.UpdatedOn,
+		},
+	}
+	opts := options.Update().SetUpsert(true)
+
+	result, err := collection.UpdateOne(ctx, filter, update, opts)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			*records = append(*records, record)
-		} else {
-			return fmt.Errorf("failed to find record: %v", err)
-		}
-	} else if existingRecord.UpdatedOn.Before(record.CreatedOn) {
-		*records = append(*records, record)
+		logger.Printf("[ERROR] - failed to upsert,userID %s record: %v", record.UserID, err)
+		return nil
+	}
+
+	if result.MatchedCount == 0 || result.ModifiedCount > 0 {
+		successLogger.Printf("[SUCCESS] - Upserted record with UserID: %s\n", record.UserID)
 	} else {
-		logger.Printf("No update needed for record with UserID: %d\n", record.UserID)
+		*records = append(*records, record)
 	}
 
 	if len(*records) >= BatchSize {
 		_, err := collection.InsertMany(ctx, *records)
 		if err != nil {
-			return fmt.Errorf("failed to insert records: %v", err)
+			return fmt.Errorf("[ERROR] - failed to insert records: %v", err)
 		}
-		*records = []interface{}{}
+		for _, r := range *records {
+			if record, ok := r.(Record); ok {
+				successLogger.Printf("[SUCCESS] - Inserted record with UserID: %s\n", record.UserID)
+			} else {
+				logger.Printf("[ERROR] - Failed to assert type for record: %v\n", r)
+			}
+		}
+		*records = (*records)[:0]
 	}
 
 	return nil
